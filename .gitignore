@@ -1,0 +1,12 @@
+*.pyc
+*.pyo
+__pycache__/
+.ipynb_checkpoints
+.DS_Store
+jax_cache
+*.pyc
+*.pyo
+__pycache__/
+.ipynb_checkpoints
+.DS_Store
+jax_cache
