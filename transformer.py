@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import equinox as eqx
 from typing import Optional
-from mla import MLA, LayerNorm
+from attentions import MLA, LayerNorm
 
 class FeedForward(eqx.Module):
     linear1: jnp.ndarray
@@ -105,7 +105,8 @@ class Transformer(eqx.Module):
         
         # Final layer norm
         self.ln_f = LayerNorm(d_model)
-
+    
+    @eqx.filter_checkpoint
     def __call__(
         self,
         input_ids: jnp.ndarray,
@@ -146,4 +147,3 @@ class Transformer(eqx.Module):
         logits = jnp.matmul(x, self.token_embedding.T)
 
         return logits, new_kv_caches
-    
