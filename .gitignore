@@ -10,4 +10,4 @@ __pycache__/
 .ipynb_checkpoints
 .DS_Store
 jax_cache
-.model.eqx
+model.eqx
