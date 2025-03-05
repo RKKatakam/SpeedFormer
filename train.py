@@ -1,138 +1,137 @@
-import jax
-import jax.numpy as jnp
-import equinox as eqx
-import optax
+import torch
+import torch.nn as nn
 import tiktoken
-from transformer import Transformer
-import json
-# save the compilations cache
-jax.config.update("jax_compilation_cache_dir", "jax_cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+import torch._dynamo
+from transformer import Decoder
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
-# Initialize tokenizer and load/clean data
-enc = tiktoken.get_encoding("gpt2")
+torch.set_float32_matmul_precision("high")
 
-def clean_text(text):
-    return ' '.join(text.split())
-
-# Load and prepare data
-with open('data.txt', 'r', encoding='utf-8') as f:
-    text = f.read()
-    cleaned_text = clean_text(text)
-
-# Tokenize
-tokens = enc.encode(cleaned_text)
-data = jnp.array(tokens)
-
-# Training parameters
-BATCH_SIZE = 32
-SEQUENCE_LENGTH = 128
-LEARNING_RATE = 3e-4
-VOCAB_SIZE = enc.n_vocab  # Use tokenizer's vocabulary size
-MAX_EPOCHS = 1
-
-# Model parameters
-D_MODEL = 512
-N_HEADS = 8
-N_LAYERS = 6
-D_FF = 2048
-MAX_SEQ_LEN = 1024
-DROPOUT_RATE = 0.1
-
-# Initialize model
-model = Transformer(
-    vocab_size=VOCAB_SIZE,
-    d_model=D_MODEL,
-    n_heads=N_HEADS,
-    n_layers=N_LAYERS,
-    d_ff=D_FF,
-    max_seq_len=MAX_SEQ_LEN,
-    dropout_rate=DROPOUT_RATE,
-    key=jax.random.PRNGKey(0)
-)
-
-
-
-def get_batch(data, batch_size, block_size, key):
-    """Generate a small batch of data of inputs x and targets y"""
-    ix = jax.random.randint(key, (batch_size,), 0, len(data) - block_size)
-    x = jnp.stack([data[i:i+block_size] for i in ix])
-    y = jnp.stack([data[i+1:i+block_size+1] for i in ix])
-    return x, y
-
-@eqx.filter_value_and_grad
-def compute_loss(model, x, y, key):
-    """Compute cross entropy loss"""
-    logits, _ = model(x, key=key)
-    # Reshape logits and targets for cross entropy
-    B, T, C = logits.shape
-    logits = logits.reshape(-1, C)
-    targets = y.reshape(-1)
-    
-    # Cross entropy loss
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-    return jnp.mean(loss)
-
-@eqx.filter_jit
-def train_step(model, opt_state, x, y, key, optimizer):
-    """Single training step"""
-    loss, grads = compute_loss(model, x, y, key)
-    updates, opt_state = optimizer.update(grads, opt_state, model)
-    model = eqx.apply_updates(model, updates)
-    return model, opt_state, loss
-
-
-def save(filename, hyperparams, model):
-    with open(filename, "wb") as f:
-        hyperparam_str = json.dumps(hyperparams)
-        f.write((hyperparam_str + "\n").encode())
-        eqx.tree_serialise_leaves(f, model)
-
-
-# Training loop
-def train():
-    model_state = model
-    key = jax.random.PRNGKey(0)
-    # Create optimizer
-    optimizer = optax.adam(LEARNING_RATE)
-    opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
-    
-    # Calculate steps per epoch
-    n_samples = len(data) - SEQUENCE_LENGTH
-    steps_per_epoch = n_samples // BATCH_SIZE
-    
-    
-    for epoch in range(MAX_EPOCHS):
-        total_loss = 0.0
-        key, epoch_key = jax.random.split(key)
+class TextDataset(Dataset):
+    def __init__(self, text, tokenizer, seq_len):
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.tokens = self.tokenizer.encode(text)
         
-        # Training steps within each epoch
-        for step in range(steps_per_epoch):
-            step_key = jax.random.fold_in(epoch_key, step)
-            batch_key, train_key = jax.random.split(step_key)
-            
-            # Get batch
-            x, y = get_batch(data, BATCH_SIZE, SEQUENCE_LENGTH, batch_key)
-            
-            # Training step
-            model_state, opt_state, loss = train_step(
-                model_state, opt_state, x, y, train_key, optimizer
-            )
-            total_loss += loss
-            
-            # Print progress every 100 steps
-            if step % 100 == 0:
-                print(f"Epoch {epoch+1}/{MAX_EPOCHS}, Step {step}/{steps_per_epoch}, Loss: {loss:.4f}")
-                # save the model
-                save("model.eqx", {"epoch": epoch, "step": step}, model_state)
+    def __len__(self):
+        return len(self.tokens) - self.seq_len
         
-        # Print epoch summary
-        avg_loss = total_loss / steps_per_epoch
-        print(f"Epoch {epoch+1}/{MAX_EPOCHS} completed. Average Loss: {avg_loss:.4f}")
+    def __getitem__(self, idx):
+        chunk = self.tokens[idx:idx + self.seq_len + 1]
+        x = torch.tensor(chunk[:-1], dtype=torch.long)
+        y = torch.tensor(chunk[1:], dtype=torch.long)
+        return x, y
+
+class GPTModel(nn.Module):
+    def __init__(self, vocab_size, d_model, n_heads, n_layers, max_len):
+        super().__init__()
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.positional_embedding = nn.Parameter(torch.randn(1, max_len, d_model))
+        self.decoder = Decoder(
+            n_layers=n_layers,
+            d_model=d_model,
+            n_heads=n_heads,
+            max_len=max_len
+        )
+        self.linear = nn.Linear(d_model, vocab_size)
+        
+    def forward(self, x, kv_caches=None, past_length=0):
+        x = self.token_embedding(x)
+        x = x + self.positional_embedding[:, past_length:past_length + x.size(1)]
+        x, new_kv_caches = self.decoder(x, kv_caches, past_length)
+        x = self.linear(x)
+        return x, new_kv_caches
+
+def train_model(model, dataloader, criterion, optimizer, epochs, device, vocab_size):
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        progress_bar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{epochs}')
+        
+        for batch_idx, (x, y) in enumerate(progress_bar):
+            x, y = x.to(device), y.to(device)
+            
+            optimizer.zero_grad()
+            logits, _ = model(x)
+            loss = criterion(logits.view(-1, vocab_size), y.view(-1))
+            
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            avg_loss = total_loss / (batch_idx + 1)
+            progress_bar.set_postfix({'loss': avg_loss})
+            
+        if epoch == epochs - 1:
+            return avg_loss
+
+def main():
+    # Hyperparameters
+    d_model = 256
+    n_heads = 4
+    n_layers = 2
+    max_len = 128
+    batch_size = 128
+    learning_rate = 1e-3
+    epochs = 7
+    compile_model = True  
     
-    return model_state
+    # Load tokenizer
+    tokenizer = tiktoken.get_encoding("gpt2")
+    vocab_size = tokenizer.n_vocab
+    
+    # Load sample text (replace with your dataset)
+    with open('data.txt', 'r', encoding='utf-8') as f:
+        text = f.read()
+    
+    # Create dataset and dataloader
+    dataset = TextDataset(text, tokenizer, max_len)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # Initialize model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = GPTModel(vocab_size, d_model, n_heads, n_layers, max_len).to(device)
+
+    
+    # Try to compile model if enabled
+    if compile_model:
+        #model = torch.compile(model)
+        print("Model compiled")
+            
+ 
+    # Training setup
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    
+    # Train model
+    final_loss = train_model(model, dataloader, criterion, optimizer, epochs, device, vocab_size)
+    print(f"Final loss: {final_loss}")
+    
+    # Save model
+    torch.save(model.state_dict(), 'speedformer_model.pt')
+    
+    # Generate sample text
+    model.eval()
+    prompt = "Harry don't "
+    input_ids = torch.tensor(tokenizer.encode(prompt)).unsqueeze(0).to(device)
+    
+    max_new_tokens = 100
+    generated_tokens = []
+    kv_caches = None
+    past_length = 0
+    
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            logits, kv_caches = model(input_ids[:, -1:], kv_caches, past_length)
+            next_token = torch.argmax(logits[:, -1], dim=-1)
+            generated_tokens.append(next_token.item())
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
+            past_length += 1
+    
+    generated_text = tokenizer.decode(generated_tokens)
+    print(f"\nPrompt: {prompt}")
+    print(f"Generated: {generated_text}")
 
 if __name__ == "__main__":
-    trained_model = train()
+    main()

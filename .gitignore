@@ -1,12 +1,14 @@
 # Ignore model files
 model.eqx
 *.eqx
+*.pt
 
 # Python related
 *.pyc
 *.pyo
 __pycache__/
 .ipynb_checkpoints
+.conda
 
 # System files
 .DS_Store
