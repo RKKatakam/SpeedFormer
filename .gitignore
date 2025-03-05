@@ -1,13 +1,13 @@
-*.pyc
-*.pyo
-__pycache__/
-.ipynb_checkpoints
-.DS_Store
-jax_cache
-*.pyc
-*.pyo
-__pycache__/
-.ipynb_checkpoints
-.DS_Store
-jax_cache
+# Ignore model files
 model.eqx
+*.eqx
+
+# Python related
+*.pyc
+*.pyo
+__pycache__/
+.ipynb_checkpoints
+
+# System files
+.DS_Store
+jax_cache
